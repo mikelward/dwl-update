@@ -1,0 +1,645 @@
+name: Upstream dwl merge
+
+# One merge of upstream dwl per week, as a REUSABLE workflow: the fork-tracking
+# sibling of npm-update, gradle-update and rust-update, consumed with:
+#
+#   uses: mikelward/dwl-update/.github/workflows/dwl-update.yml@main
+#
+# from a small caller workflow that owns the cron and passes
+# `secrets: inherit`. See README.md for the caller shape and the permissions
+# it must grant.
+#
+# The consumer (tidewm) keeps upstream by MERGING, never rebasing, so its
+# history carries upstream's commits under their own hashes and each week's
+# merge only has to reconcile what is new. The job merges upstream's branch
+# into the default branch with `git merge --no-edit`, builds the result, and
+# opens one pull request on the `dwl-update` branch. A merge that conflicts is
+# never published: the conflicting files go into an issue for a human.
+#
+# The trust split is the siblings': building the merge runs code nobody has
+# reviewed yet (upstream's new commits, and whatever Makefile the merge
+# produced), so the update job holds no write token. It records the merge
+# commit's hash BEFORE anything is built and hands the commit over as a git
+# bundle. The publish job, a fresh runner that builds nothing, checks the
+# bundle against that hash, re-derives the merge itself with
+# `git merge-tree` from a clean context, and only then pushes. A commit hash
+# names its tree and parents, so a bundle that passes both checks is exactly
+# git's own merge of the base and upstream, whatever happened on the update
+# runner afterwards.
+
+on:
+  workflow_call:
+    inputs:
+      upstream-url:
+        description: The upstream repository to merge from.
+        type: string
+        default: https://codeberg.org/dwl/dwl.git
+      upstream-branch:
+        description: The upstream branch to merge.
+        type: string
+        default: main
+      container:
+        description: >-
+          The container image the update job builds in. tidewm needs
+          wlroots 0.20, which Ubuntu's runners don't ship; Debian testing
+          does, and it is where tide runs tidewm. Empty runs on the runner
+          itself.
+        type: string
+        default: debian:testing
+      setup:
+        description: >-
+          A shell script that installs what the checks need. It runs as
+          root in the container before the checkout, so it must install
+          git (the checkout needs it to fetch history) and CA certificates
+          (the upstream fetch needs them).
+        type: string
+        default: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates git build-essential pkgconf libwlroots-0.20-dev \
+            libwayland-dev wayland-protocols libinput-dev libxkbcommon-dev \
+            libxcb1-dev libxcb-icccm4-dev libjson-c-dev libpcre2-dev
+      checks:
+        description: >-
+          Commands that validate the merge, one per line, run at the
+          repository root after the merge is committed and fingerprinted.
+          Each runs even after one fails, so the PR body reports them all.
+          The second default rebuilds with -B: the Makefile doesn't depend
+          on XWAYLAND, so a plain `make` after the first would link the
+          non-Xwayland objects and check nothing.
+        type: string
+        default: |
+          make
+          make -B XWAYLAND=-DXWAYLAND XLIBS="xcb xcb-icccm"
+      environment:
+        description: >-
+          The deployment environment the publish job runs in, and so the
+          environment whose secrets it can read. The credential
+          (DWL_UPDATE_PAT, or DWL_UPDATE_APP_ID plus
+          DWL_UPDATE_APP_PRIVATE_KEY) belongs there, not among the
+          repository's secrets: a repository secret reaches the runner of
+          EVERY job in this workflow through `secrets: inherit`, the update
+          job included, where unreviewed code builds as root, while an
+          environment secret reaches only the job that declares the
+          environment, and the update job never does.
+        type: string
+        default: dwl-update
+
+# Explicitly empty: the CALLER grants the real permissions and every job below
+# declares its own downscoped block, so a future job that forgets its own
+# block gets no ambient token.
+permissions: {}
+
+jobs:
+  # Merges and builds. Building runs code nobody has reviewed yet, so this
+  # job holds a read-only token and cannot push anything.
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Not pinned by digest: the default tracks Debian testing on purpose,
+    # as the consumer's own CI does, and the caller picks the image.
+    container:
+      image: ${{ inputs.container }}  # zizmor: ignore[unpinned-images]
+    permissions:
+      contents: read
+    outputs:
+      # none: upstream has nothing new; merged: a merge commit to publish;
+      # conflict: the merge conflicts and nothing was built.
+      state: ${{ steps.merge.outputs.state }}
+      base: ${{ steps.merge.outputs.base }}
+      upstream: ${{ steps.merge.outputs.upstream }}
+      merge_sha: ${{ steps.merge.outputs.merge_sha }}
+      checks_sha: ${{ steps.checks.outputs.checks_sha }}
+    steps:
+      - name: Install what the checks need
+        env:
+          SETUP: ${{ inputs.setup }}
+        shell: bash
+        run: bash -euo pipefail -c "$SETUP"
+
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
+        with:
+          # Always the default branch, never the dispatch ref: a manual run
+          # from a feature branch must not base the merge on it.
+          ref: ${{ github.event.repository.default_branch }}
+          # The merge base is somewhere in history.
+          fetch-depth: 0
+          # The checks execute unreviewed code; the token is read-only, and
+          # dropping it from .git/config keeps one less credential in reach.
+          persist-credentials: false
+
+      # Everything this job hands to publish is recorded HERE, before any
+      # unreviewed code runs: a step's outputs are captured when it ends,
+      # and nothing that runs later can reach back and change them.
+      - name: Merge upstream
+        id: merge
+        shell: bash
+        env:
+          UPSTREAM_URL: ${{ inputs.upstream-url }}
+          UPSTREAM_BRANCH: ${{ inputs.upstream-branch }}
+        run: |
+          set -euo pipefail
+          # Checkout ran as root on a workspace the runner owns.
+          git config --global --add safe.directory "$PWD"
+          if test -n "$(git ls-files -- .dwl-update)"; then
+            echo '::error::this repository tracks .dwl-update, which this workflow uses for its handoff; rename it to run the weekly merge.'
+            exit 1
+          fi
+          base=$(git rev-parse HEAD)
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch --no-tags upstream "+refs/heads/$UPSTREAM_BRANCH:refs/remotes/upstream/$UPSTREAM_BRANCH"
+          upstream=$(git rev-parse "refs/remotes/upstream/$UPSTREAM_BRANCH")
+          echo "upstream=$upstream" >> "$GITHUB_OUTPUT"
+          # --no-ff, so even a fork with nothing of its own gets a merge
+          # commit whose parents publish can check.
+          if git merge-base --is-ancestor "$upstream" "$base"; then
+            echo 'state=none' >> "$GITHUB_OUTPUT"
+            echo "Nothing new upstream: $upstream is already merged." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if ! git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              merge --no-edit --no-ff "upstream/$UPSTREAM_BRANCH"; then
+            # Never committed, never built. The conflict job re-derives the
+            # file list from a clean context; this one is for the log.
+            echo '::warning::The merge conflicts in:'
+            git diff --name-only --diff-filter=U
+            git merge --abort
+            echo 'state=conflict' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          merge_sha=$(git rev-parse HEAD)
+          echo "merge_sha=$merge_sha" >> "$GITHUB_OUTPUT"
+          mkdir .dwl-update
+          git bundle create .dwl-update/merge.bundle HEAD "^$base"
+          echo 'state=merged' >> "$GITHUB_OUTPUT"
+
+      # The PR this run opens under DWL_UPDATE_PAT or the App runs the
+      # consumer's own CI as well; these checks are what the run itself can
+      # vouch for, and what decides the title and the auto-merge. This is
+      # the untrusted window: the merge's code builds here.
+      - name: Run the checks
+        if: steps.merge.outputs.state == 'merged'
+        id: checks
+        shell: bash
+        env:
+          CHECKS: ${{ inputs.checks }}
+        run: |
+          set +e
+          failed=0
+          : > .dwl-update/checks.md
+          while IFS= read -r cmd; do
+            if test -z "$cmd"; then continue; fi
+            echo "::group::$cmd"
+            # A subshell, so a check that changes shell state cannot move
+            # where the loop writes or where the next check runs. The runner
+            # command files point at /dev/null inside it, closing the casual
+            # channel for forging THIS step's outputs; stdin too, so a check
+            # that reads stdin cannot drain the remaining commands.
+            ( export GITHUB_OUTPUT=/dev/null GITHUB_ENV=/dev/null \
+                GITHUB_PATH=/dev/null GITHUB_STEP_SUMMARY=/dev/null \
+                GITHUB_STATE=/dev/null
+              eval "$cmd" ) < /dev/null
+            rc=$?
+            echo '::endgroup::'
+            if test "$rc" -eq 0; then
+              echo "- ✅ \`$cmd\`" >> .dwl-update/checks.md
+            else
+              echo "- ❌ \`$cmd\` (exit $rc)" >> .dwl-update/checks.md
+              failed=1
+            fi
+          done <<< "$CHECKS"
+          # Fail closed from here: a record that cannot be written must go
+          # red rather than let a missing verdict decide the title.
+          set -e
+          cat .dwl-update/checks.md >> "$GITHUB_STEP_SUMMARY"
+          # Fingerprinted as a step OUTPUT, out of reach of any process the
+          # build left running; publish verifies the downloaded copy.
+          echo "checks_sha=$(sha256sum .dwl-update/checks.md | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          # The build ran above, and these files apply to LATER steps, so a
+          # planted binary could otherwise shadow anything the upload runs.
+          : > "$GITHUB_PATH"
+          : > "$GITHUB_ENV"
+
+      - name: Hand off the merge
+        if: steps.merge.outputs.state == 'merged'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: dwl-update
+          path: |
+            .dwl-update/merge.bundle
+            .dwl-update/checks.md
+          retention-days: 1
+          if-no-files-found: error
+          include-hidden-files: true
+
+  # A conflicting merge is never published. This job files one issue naming
+  # the conflicting files, from its own re-derivation of the merge, then
+  # fails the run so the conflict is loud. It needs no credential: issues
+  # are written with GITHUB_TOKEN, and nothing it opens has CI to trigger.
+  conflict:
+    needs: update
+    if: needs.update.outputs.state == 'conflict'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: File the conflict
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_URL: ${{ inputs.upstream-url }}
+          UPSTREAM_BRANCH: ${{ inputs.upstream-branch }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          TITLE: 'Merge upstream dwl: conflicts'
+        run: |
+          set -euo pipefail
+          git fetch --no-tags "$UPSTREAM_URL" "+refs/heads/$UPSTREAM_BRANCH:refs/remotes/upstream/$UPSTREAM_BRANCH"
+          upstream=$(git rev-parse "refs/remotes/upstream/$UPSTREAM_BRANCH")
+          base=$(git rev-parse HEAD)
+          # The authoritative list: git's own merge, computed here, where
+          # nothing from the merge has run. Exit 1 means conflicts.
+          rc=0
+          git merge-tree --write-tree --name-only --no-messages -z "$base" "$upstream" > merge-tree.out || rc=$?
+          if test "$rc" -eq 0; then
+            echo "The default branch moved and $upstream now merges cleanly; the next run will open the pull request." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if test "$rc" -ne 1; then
+            echo "::error::git merge-tree failed with exit $rc."
+            exit 1
+          fi
+          {
+            echo "Upstream \`$UPSTREAM_BRANCH\` ($upstream) no longer merges cleanly into \`$DEFAULT_BRANCH\` ($base), so the weekly merge has no pull request to open."
+            echo
+            echo '## Conflicting files'
+            echo
+            # The first record is the tree; the rest are paths, one per
+            # conflicted stage, so duplicates are dropped.
+            tail -z -n +2 merge-tree.out | sort -zu | tr '\0' '\n' | sed '/^$/d; s/.*/- `&`/'
+            echo
+            echo '## Upstream commits to merge'
+            echo
+            echo '```'
+            git log --oneline "$base..$upstream" | sed 's/```/` ` `/g'
+            echo '```'
+            echo
+            echo '## Resolving it'
+            echo
+            echo '```sh'
+            echo "git remote add upstream $UPSTREAM_URL"
+            echo "git fetch upstream $UPSTREAM_BRANCH"
+            echo "git merge upstream/$UPSTREAM_BRANCH"
+            echo '```'
+            echo
+            echo 'Fix the conflicts, commit the merge on a branch of its own and open a pull request that says "Closes" and this issue, merging it with a merge commit, never a rebase or a squash. Each weekly run updates this issue until then.'
+            echo
+            echo '---'
+            echo '_Filed by the weekly dwl-update workflow._'
+          } > body.md
+          # One issue, updated weekly, never a new one each week.
+          issue=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues?state=open&creator=github-actions%5Bbot%5D" \
+            --jq '.[] | select(.pull_request == null and .title == env.TITLE) | .number' | head -n 1)
+          if test -n "$issue"; then
+            gh issue edit "$issue" --body-file body.md
+          else
+            issue_url=$(gh issue create --title "$TITLE" --body-file body.md)
+            issue=${issue_url##*/}
+            gh issue edit "$issue" --add-assignee "$GITHUB_REPOSITORY_OWNER" \
+              || echo "Could not assign #$issue to $GITHUB_REPOSITORY_OWNER." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          cat body.md >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::Upstream conflicts with $DEFAULT_BRANCH; see #$issue."
+          exit 1
+
+  # Publishes. A fresh runner that builds nothing, so the credential is never
+  # on a machine where the merge's code has run.
+  publish:
+    needs: update
+    if: needs.update.outputs.state == 'merged'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # The environment whose secrets this job may read; see the `environment`
+    # input. Only this job declares it.
+    environment: ${{ inputs.environment }}
+    permissions:
+      # Scopes only the job's own GITHUB_TOKEN; a PAT or App token carries
+      # its own grant. Kept to what GITHUB_TOKEN would need, since a caller
+      # with neither still runs on it.
+      contents: write
+      pull-requests: write
+      # Closing the conflict issue once upstream merges cleanly again.
+      issues: write
+    # Read once into env: the secrets context is unavailable in a reusable
+    # workflow's own if: conditions.
+    env:
+      APP_ID: ${{ secrets.DWL_UPDATE_APP_ID }}
+      APP_PRIVATE_KEY: ${{ secrets.DWL_UPDATE_APP_PRIVATE_KEY }}
+      PAT: ${{ secrets.DWL_UPDATE_PAT }}
+    steps:
+      # A partial App credential mints no token; refuse it rather than fall
+      # back to GITHUB_TOKEN silently. Moot once a PAT, which wins, is set.
+      - name: Refuse a half-supplied App credential
+        if: env.PAT == '' && (env.APP_ID == '') != (env.APP_PRIVATE_KEY == '')
+        run: |
+          echo "::error::DWL_UPDATE_APP_ID and DWL_UPDATE_APP_PRIVATE_KEY must both be set, or both left empty."
+          exit 1
+
+      - name: Mint a GitHub App installation token
+        id: app-token
+        if: env.PAT == '' && env.APP_ID != ''
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ env.APP_ID }}
+          private-key: ${{ env.APP_PRIVATE_KEY }}
+          # No wider than what this job uses, whatever the App is granted.
+          permission-contents: write
+          permission-pull-requests: write
+
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
+        with:
+          # The exact commit the update job merged into.
+          ref: ${{ needs.update.outputs.base }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0  # v5.0.0
+        with:
+          name: dwl-update
+          path: .dwl-update
+
+      # The bundle traveled through a machine that ran the merge's code.
+      # Its commit must be the one recorded before any of that ran, and that
+      # commit must be git's own merge of the base and upstream, re-derived
+      # here. Update-job outputs enter as env, never inline: as env a forged
+      # value is data, bounded to a failed comparison.
+      - name: Check the merge against the pre-build fingerprint
+        env:
+          BASE: ${{ needs.update.outputs.base }}
+          UPSTREAM: ${{ needs.update.outputs.upstream }}
+          MERGE_SHA: ${{ needs.update.outputs.merge_sha }}
+          CHECKS_SHA: ${{ needs.update.outputs.checks_sha }}
+          UPSTREAM_URL: ${{ inputs.upstream-url }}
+          UPSTREAM_BRANCH: ${{ inputs.upstream-branch }}
+        run: |
+          set -euo pipefail
+          git config --global core.hooksPath /dev/null
+          git bundle verify -q .dwl-update/merge.bundle
+          git fetch --no-tags -q .dwl-update/merge.bundle HEAD
+          if test "$(git rev-parse FETCH_HEAD)" != "$MERGE_SHA"; then
+            echo '::error::The bundle does not hold the merge the update job recorded.'
+            exit 1
+          fi
+          if test "$(git rev-parse "$MERGE_SHA^@" | tr '\n' ' ')" != "$BASE $UPSTREAM "; then
+            echo '::error::The merge commit is not a merge of the base and upstream.'
+            exit 1
+          fi
+          # Upstream fetched fresh from here: the merged commit must really
+          # be on upstream's branch, not something the update job named.
+          git fetch --no-tags -q "$UPSTREAM_URL" "+refs/heads/$UPSTREAM_BRANCH:refs/remotes/upstream/$UPSTREAM_BRANCH"
+          if ! git merge-base --is-ancestor "$UPSTREAM" "refs/remotes/upstream/$UPSTREAM_BRANCH"; then
+            echo "::error::$UPSTREAM is not on upstream's $UPSTREAM_BRANCH."
+            exit 1
+          fi
+          tree=$(git merge-tree --write-tree "$BASE" "$UPSTREAM")
+          if test "$tree" != "$(git rev-parse "$MERGE_SHA^{tree}")"; then
+            echo "::error::The merge commit's tree is not git's own merge of $BASE and $UPSTREAM."
+            exit 1
+          fi
+          mv .dwl-update/checks.md checks.md
+          rm -rf .dwl-update
+          if test "$(sha256sum checks.md | cut -d' ' -f1)" != "$CHECKS_SHA"; then
+            echo '::error::checks.md does not match what the update job recorded.'
+            exit 1
+          fi
+
+      # The verdict comes from checks.md's own fingerprint-verified content,
+      # never a pass/fail flag the untrusted job reported about itself, and
+      # fails closed: a line that isn't the exact rendering of a configured
+      # check, or a check recorded a different number of times than it is
+      # configured, counts as failed.
+      - name: Derive the check verdict from checks.md
+        id: verdict
+        env:
+          CHECKS: ${{ inputs.checks }}
+        run: |
+          set -euo pipefail
+          declare -A expected_count recorded_count
+          while IFS= read -r cmd; do
+            if test -z "$cmd"; then continue; fi
+            expected_count["$cmd"]=$(( ${expected_count["$cmd"]:-0} + 1 ))
+          done <<< "$CHECKS"
+          failed=0
+          while IFS= read -r line || test -n "$line"; do
+            if test -z "$line"; then continue; fi
+            matched=''
+            for cmd in "${!expected_count[@]}"; do
+              if test "$line" = "- ✅ \`$cmd\`"; then
+                matched=$cmd
+                is_failed=0
+                break
+              fi
+              prefix="- ❌ \`$cmd\` (exit "
+              rest=${line#"$prefix"}
+              if test "$rest" != "$line" && [[ "$rest" =~ ^[0-9]+\)$ ]]; then
+                matched=$cmd
+                is_failed=1
+                break
+              fi
+            done
+            if test -z "$matched"; then
+              echo "::error::checks.md has a line that records no configured check; treating as failed: $line"
+              echo 'passed=false' >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            recorded_count["$matched"]=$(( ${recorded_count["$matched"]:-0} + 1 ))
+            if test "$is_failed" -eq 1; then failed=1; fi
+          done < checks.md
+          for cmd in "${!expected_count[@]}"; do
+            if test "${recorded_count[$cmd]:-0}" -ne "${expected_count[$cmd]}"; then
+              echo "::error::checks.md records '$cmd' ${recorded_count[$cmd]:-0} time(s), expected ${expected_count[$cmd]}; treating as failed."
+              echo 'passed=false' >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          if test "$failed" -eq 1; then
+            echo 'passed=false' >> "$GITHUB_OUTPUT"
+          else
+            echo 'passed=true' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Stop if the default branch moved while the checks ran
+        env:
+          GH_TOKEN: ${{ env.PAT || steps.app-token.outputs.token || github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          BASE: ${{ needs.update.outputs.base }}
+        run: |
+          set -euo pipefail
+          encoded=$(printf %s "$DEFAULT_BRANCH" | jq -sRr @uri)
+          current=$(gh api "repos/${GITHUB_REPOSITORY}/commits/$encoded" --jq .sha)
+          if test "$current" != "$BASE"; then
+            echo "::error::$DEFAULT_BRANCH moved from $BASE to $current while the checks ran, so the merge was built on a stale base. Re-run the workflow."
+            exit 1
+          fi
+
+      - name: Open the pull request
+        env:
+          GH_TOKEN: ${{ env.PAT || steps.app-token.outputs.token || github.token }}
+          # Whether this run authors as a real collaborator (a PAT or the
+          # App) rather than GITHUB_TOKEN, whose pull requests' CI waits
+          # for a manual approval.
+          NONDEFAULT_TOKEN_USED: ${{ env.PAT != '' || steps.app-token.outputs.token != '' }}
+          # Always GITHUB_TOKEN: issues and the ruleset read are outside
+          # the two permissions the PAT and the App are asked for.
+          DEFAULT_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          PASSED: ${{ steps.verdict.outputs.passed }}
+          BASE: ${{ needs.update.outputs.base }}
+          UPSTREAM: ${{ needs.update.outputs.upstream }}
+          MERGE_SHA: ${{ needs.update.outputs.merge_sha }}
+          UPSTREAM_URL: ${{ inputs.upstream-url }}
+          UPSTREAM_BRANCH: ${{ inputs.upstream-branch }}
+          BRANCH: dwl-update
+          CONFLICT_TITLE: 'Merge upstream dwl: conflicts'
+        run: |
+          set -euo pipefail
+          # No date and no hash in the title: it becomes the merge commit's
+          # subject, which a user reads.
+          if test "$PASSED" != 'true'; then
+            title='Merge upstream dwl — CHECKS FAILING'
+            verdict='**One or more checks failed.** Do not merge until they are fixed: push the fixes to this branch.'
+          else
+            title='Merge upstream dwl'
+            verdict='All checks passed in the job that built this merge.'
+          fi
+
+          remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+
+          # One long-lived branch, replaced each week. Replaced only when its
+          # tip is this workflow's own work: a merge commit with nothing
+          # beyond it that isn't already on the base or upstream. A branch
+          # someone pushed to (a conflict resolution, a build fix) is left
+          # alone, and the run goes red to say so.
+          pushed=false
+          existing=$(git ls-remote "$remote" "refs/heads/$BRANCH" | cut -f1)
+          if test "$existing" = "$MERGE_SHA"; then
+            echo "$BRANCH already holds this merge (a rerun)." >> "$GITHUB_STEP_SUMMARY"
+          elif test -n "$existing"; then
+            git fetch --no-tags -q "$remote" "refs/heads/$BRANCH"
+            extra=$(git rev-list FETCH_HEAD --not "$BASE" "refs/remotes/upstream/$UPSTREAM_BRANCH")
+            if test "$extra" != "$existing" \
+               || test "$(git rev-list --parents -n 1 FETCH_HEAD | wc -w)" -ne 3 \
+               || test "$(git log -1 --format=%an FETCH_HEAD)" != 'github-actions[bot]'; then
+              echo "::error::$BRANCH has commits this workflow didn't make. Merge or close its pull request, or delete the branch, and the next run replaces it."
+              exit 1
+            fi
+            git push --force-with-lease="refs/heads/$BRANCH:$existing" "$remote" "$MERGE_SHA:refs/heads/$BRANCH"
+            pushed=true
+          else
+            git push "$remote" "$MERGE_SHA:refs/heads/$BRANCH"
+            pushed=true
+          fi
+
+          pr_opened_here=false
+          pr=$(gh api "repos/${GITHUB_REPOSITORY}/pulls?head=${GITHUB_REPOSITORY_OWNER}:${BRANCH}&state=open" \
+            --jq '[.[] | select(.base.ref == env.DEFAULT_BRANCH)][0].number // empty')
+          if test -z "$pr"; then
+            pr_url=$(gh pr create --title "$title" \
+              --body 'Opening; the report lands in a moment.' \
+              --base "$DEFAULT_BRANCH" --head "$BRANCH")
+            pr=${pr_url##*/}
+            pr_opened_here=true
+          fi
+          nondefault_opened_pr=false
+          if test "$NONDEFAULT_TOKEN_USED" = 'true' && { test "$pushed" = true || test "$pr_opened_here" = true; }; then
+            nondefault_opened_pr=true
+          fi
+
+          # Clear any arming from an earlier week before the body changes,
+          # and confirm it is gone: --disable-auto fails both when nothing
+          # was armed and when the call failed, so only a read proves it.
+          gh pr merge --disable-auto "$pr" >/dev/null 2>&1 || true
+          armed=$(gh pr view "$pr" --json autoMergeRequest --jq '.autoMergeRequest != null') || {
+            echo "::error::could not confirm the auto-merge state of PR #$pr."
+            exit 1
+          }
+          if test "$armed" != 'false'; then
+            echo "::error::a stale auto-merge on PR #$pr could not be disarmed."
+            exit 1
+          fi
+
+          {
+            echo "Merges upstream \`$UPSTREAM_BRANCH\` ($UPSTREAM) from $UPSTREAM_URL into \`$DEFAULT_BRANCH\`."
+            echo
+            echo '## Upstream commits'
+            echo
+            echo '```'
+            git log --oneline "$BASE..$UPSTREAM" | sed 's/```/` ` `/g'
+            echo '```'
+            echo
+            echo '## Checks'
+            echo
+            cat checks.md
+            echo
+            echo "$verdict"
+            echo
+            if test "$nondefault_opened_pr" != 'true'; then
+              echo '> **This pull request was not opened with DWL_UPDATE_PAT or the App, so its CI may be waiting for approval.** Check the checks tab, or push any commit to the branch.'
+              echo
+            fi
+            echo 'Merge it with a merge commit, never a rebase or a squash: upstream'"'"'s commits must land under their own hashes, or next week'"'"'s merge starts over.'
+            echo
+            echo '---'
+            echo '_Opened by the weekly dwl-update workflow._'
+          } > body.md
+          if ! gh pr edit "$pr" --title "$title" --body-file body.md; then
+            echo "::warning::Could not publish the body of #$pr; it still carries the placeholder."
+          fi
+
+          reviewer=$GITHUB_REPOSITORY_OWNER
+          if ! gh pr edit "$pr" --add-assignee "$reviewer" --add-reviewer "$reviewer"; then
+            echo "Could not assign or request review from @$reviewer." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # Codex's automatic review doesn't fire for a PR an App opens
+          # (rust-update's experience), so ask for it; harmless if redundant.
+          if test "$nondefault_opened_pr" = 'true'; then
+            if ! gh pr comment "$pr" --body '@codex review'; then
+              echo "Could not post the @codex review nudge on #$pr; it needs a manual one." >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
+
+          # Upstream merges cleanly again, so an open conflict issue is done.
+          issue=$(GH_TOKEN="$DEFAULT_TOKEN" gh api --paginate "repos/${GITHUB_REPOSITORY}/issues?state=open&creator=github-actions%5Bbot%5D" \
+            --jq '.[] | select(.pull_request == null and .title == env.CONFLICT_TITLE) | .number' | head -n 1) || issue=''
+          if test -n "$issue"; then
+            GH_TOKEN="$DEFAULT_TOKEN" gh issue close "$issue" --comment "Upstream merges cleanly again: #$pr." \
+              || echo "Could not close #$issue." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # Arm auto-merge only when this run's checks passed AND the ruleset
+          # requires branches to be up to date, the siblings' rule: auto-merge
+          # can fire long after this job, and without the strict policy a base
+          # that moved meanwhile would merge a tree nobody built. --merge,
+          # never --rebase or --squash: either would drop the merge commit and
+          # rewrite upstream's hashes. Pinned to the commit validated above.
+          strict=$(GH_TOKEN="$DEFAULT_TOKEN" gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/rules/branches/$(printf %s "$DEFAULT_BRANCH" | jq -sRr @uri)" \
+            | jq '[.[][] | select(.type == "required_status_checks")
+                         | .parameters.strict_required_status_checks_policy] | any') || strict=false
+          if test "$PASSED" = 'true' && test "$strict" = 'true'; then
+            if ! gh pr merge --auto --merge --subject "$title" --match-head-commit "$MERGE_SHA" "$pr"; then
+              echo 'Could not arm auto-merge (are merge commits allowed?); the PR waits for a manual merge.' >> "$GITHUB_STEP_SUMMARY"
+            fi
+          elif test "$PASSED" != 'true'; then
+            echo 'Checks failed, so auto-merge was not armed.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'Auto-merge was not armed: the ruleset does not require branches to be up to date.' >> "$GITHUB_STEP_SUMMARY"
+          fi

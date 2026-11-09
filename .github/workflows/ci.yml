@@ -1,5 +1,8 @@
 name: ci
 
+# Consumers call the reusable workflow at `@main`, with no release step after
+# it, so this suite on the pull request is the only gate between a change and
+# every consumer's weekly run.
 on:
   push:
     branches: ["main"]
@@ -9,6 +12,16 @@ on:
 permissions:
   contents: read
   pull-requests: read
+
+# simmo's shape (mikelward/simmo ci.yml, which says why each half is so). A
+# pull request shares one group and cancels the run in progress when a newer
+# event on it starts one. A push to main, or a dispatch aimed at it, gets a
+# group of its own keyed by commit, so no main run is canceled. An `edited`
+# run never cancels: it carries the head as of the edit, and GitHub doesn't
+# promise to start it after the push's run.
+concurrency:
+  group: ci-${{ (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')) && format('main-{0}', github.sha) || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ !(github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')) && github.event.action != 'edited' }}
 
 jobs:
   classify:
@@ -27,25 +40,28 @@ jobs:
           mode: classify
           pr: ${{ github.event.pull_request.number }}
 
-  # TODO: replace this with the project's real jobs (test, build, lint,
-  # ...), each carrying `needs: classify` and
-  # `if: needs.classify.outputs.docs_only != 'true'`. Add each job's name
-  # to the `lanes` job's own `needs:` and `results:` below, and delete this
-  # placeholder once a real job exists -- see mikelward/lanes's README for
-  # the documented shape.
-  placeholder:
+  # The workflow-shape tests, plus the workflow's own shell steps run against
+  # scratch git repositories. Dependency-free on purpose: no install step.
+  test:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     needs: classify
     if: needs.classify.outputs.docs_only != 'true'
     steps:
-      - run: echo "no real jobs yet -- see the TODO in this file"
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38  # v6.5.0
+        with:
+          node-version: '24'
+      - name: Test
+        run: node --test *.test.js
 
   lanes:
     name: lanes
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    needs: [classify, placeholder]
+    needs: [classify, test]
     if: always()
     steps:
       - uses: actions/checkout@v5
@@ -57,4 +73,4 @@ jobs:
           pr: ${{ github.event.pull_request.number }}
           classify-result: ${{ needs.classify.result }}
           base-sha: ${{ needs.classify.outputs.base_sha }}
-          results: placeholder=${{ needs.placeholder.result }}
+          results: test=${{ needs.test.result }}
