@@ -21,10 +21,15 @@ rules:
         # Everything else must pin to a hash.
         "*": hash-pin
   dangerous-triggers:
-    # Load-bearing pull_request_target usage in the codex-review pair,
+    # Load-bearing pull_request_target usage. The codex-review pair is
     # reasoned through in mikelward/codex-review's own docs/CONSUMER.md:
     # neither checks out or executes pull request code with the elevated
     # token.
     ignore:
       - codex-review.yml
       - codex-review-check.yml
+      # ci.yml: pull_request_target so a pull request cannot rewrite the
+      # jobs behind its own required `lanes` status. Its jobs check out the
+      # merge ref explicitly, and none that runs pull request code names a
+      # secret -- see the comment at the top of ci.yml.
+      - ci.yml
