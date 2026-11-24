@@ -1,7 +1,7 @@
 ---
 trigger: always_on
 alwaysApply: true
-last_modified: 2026-11-07
+last_modified: 2026-11-24
 ---
 
 # dwl-update
@@ -31,6 +31,8 @@ Shared by every mikelward repo and the user-level agent config; canonical in mik
 - **Claude Code**. It reliably shows only a turn's last message; put everything there.
 - **Replies**. Short, key point first, ending with open PR links and any pending
   question.
+- **Commands and URLs**. Give ones that work as pasted, never placeholders: find each
+  value in the repo first, and ask only for those it lacks.
 - **Network access**. If you want access to a host and you can't access it or a mirror,
   ask the user to allowlist the domain(s) along with the purpose.
 
@@ -45,7 +47,6 @@ Shared by every mikelward repo and the user-level agent config; canonical in mik
   titles match.
 - **Prefixes**. `docs:`, `test:`, `build:`, `refactor:` mark what users won't notice. No
   `feat:` or `fix:`.
-- **Model names**. Never in anything pushed.
 - **After a merge**. Branch afresh.
 - **Shallow clones**. Unshallow before trusting history or calculating a version code.
 - **Language**. US English everywhere.
@@ -92,6 +93,8 @@ Shared by every mikelward repo and the user-level agent config; canonical in mik
 - **Autopilot**. Drive without asking, logging guesses in `TODO.md` under *Decisions
   needing review*. Still ask before anything irreversible, outside this repo, or private.
 - **Red baseline**. Fix existing failures first, in their own commit.
+- **Fix fully**. Fix a reported problem's cause, everywhere it occurs (every platform,
+  consumer and copy), not only the case reported.
 - **Lasting fixes**. Fix the cause in a repo. Don't propose a step that lasts only this
   session (stopping a service, a setting in this container) or a hand edit to a dotfile:
   neither persists.
@@ -105,12 +108,17 @@ Shared by every mikelward repo and the user-level agent config; canonical in mik
 - **Errors**. Never swallow one silently: every catch logs it with context (no user
   data), cleans up what the `try` acquired, and handles the case explicitly. To ignore
   one on purpose, say why in a comment and still log it at debug level.
+- **Logs**. Every process logs that it started, that it ended and how, and each error,
+  where that outlasts it, a logout and a reboot: the journal, or a file under
+  `~/.local/state`. Never only `/tmp`, a runtime directory or `/dev/null`.
 - **Cost**. State the cost and reliability of new dependencies or services up front.
 - **Privacy**. No user data (personal paths, hostnames, tokens, keys, private remotes)
   leaves this machine; use placeholders.
 - **Portability**. Flag anything that won't run on Linux and macOS.
 - **UI text**. Words a person would say, as few as do the job. Say what a setting does;
   leave out what works by default, what the screen already shows, and how it works.
+- **Terminology**. Standard domain terms, never coined ones: "Text console layout is
+  Dvorak", not "The text consoles type Dvorak"; "dimming inactive windows", not "the dim".
 
 ## Project
 
